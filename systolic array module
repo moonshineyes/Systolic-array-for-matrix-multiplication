@@ -1,0 +1,171 @@
+
+module systolic_array (
+    input  wire clk,
+    input  wire rst_n,
+    input  wire start,
+
+    // Matrix A packed as 128 bits (16 bytes)
+    // Element A[row][col] = a_mat[8*(row*4+col) +: 8]
+    input  wire [127:0] a_mat,
+
+    // Matrix B packed the same way
+    input  wire [127:0] b_mat,
+
+    // 16 output results C[i][j]
+    output wire signed [31:0] c00, c01, c02, c03,
+    output wire signed [31:0] c10, c11, c12, c13,
+    output wire signed [31:0] c20, c21, c22, c23,
+    output wire signed [31:0] c30, c31, c32, c33,
+
+    output reg done
+);
+
+    // ----------------------------------------------------------
+    // Counter: 0 to 9
+    // active=1 means array is computing, 0 means sleeping
+    // ----------------------------------------------------------
+    reg [3:0] count;
+    reg       active;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            count  <= 0;
+            active <= 0;
+            done   <= 0;
+        end
+        else begin
+            done <= 0; // default LOW every cycle
+
+            if (start) begin
+                active <= 1;
+                count  <= 0;
+            end
+            else if (active) begin
+                if (count == 9) begin
+                    active <= 0;
+                    done   <= 1; // HIGH for exactly 1 cycle
+                    count  <= 0;
+                end
+                else begin
+                    count <= count + 1;
+                end
+            end
+        end
+    end
+
+    // ----------------------------------------------------------
+    // Helper: extract one signed byte from packed matrix
+    // ----------------------------------------------------------
+    function signed [7:0] get_elem;
+        input [127:0] mat;
+        input integer row, col;
+        begin
+            get_elem = mat[8*(row*4 + col) +: 8];
+        end
+    endfunction
+
+    // ----------------------------------------------------------
+    // Staggered data feeds
+    // Row r of A is fed starting at cycle r
+    // Col c of B is fed starting at cycle c
+    // ----------------------------------------------------------
+    reg signed [7:0] a0, a1, a2, a3; // feeds for row 0,1,2,3
+    reg signed [7:0] b0, b1, b2, b3; // feeds for col 0,1,2,3
+
+    always @(*) begin
+        // Default: zero feeds (no data = no switching = less power)
+        a0=0; a1=0; a2=0; a3=0;
+        b0=0; b1=0; b2=0; b3=0;
+
+        if (active) begin
+            // Row 0: cycles 0,1,2,3
+            if (count <= 3)
+                a0 = get_elem(a_mat, 0, count);
+
+            // Row 1: cycles 1,2,3,4
+            if (count >= 1 && count <= 4)
+                a1 = get_elem(a_mat, 1, count-1);
+
+            // Row 2: cycles 2,3,4,5
+            if (count >= 2 && count <= 5)
+                a2 = get_elem(a_mat, 2, count-2);
+
+            // Row 3: cycles 3,4,5,6
+            if (count >= 3 && count <= 6)
+                a3 = get_elem(a_mat, 3, count-3);
+
+            // Col 0: cycles 0,1,2,3
+            if (count <= 3)
+                b0 = get_elem(b_mat, count, 0);
+
+            // Col 1: cycles 1,2,3,4
+            if (count >= 1 && count <= 4)
+                b1 = get_elem(b_mat, count-1, 1);
+
+            // Col 2: cycles 2,3,4,5
+            if (count >= 2 && count <= 5)
+                b2 = get_elem(b_mat, count-2, 2);
+
+            // Col 3: cycles 3,4,5,6
+            if (count >= 3 && count <= 6)
+                b3 = get_elem(b_mat, count-3, 3);
+        end
+    end
+
+    // ----------------------------------------------------------
+    // Internal wires connecting PEs
+    // a_wire[r][c] = A data entering PE at row r, col c
+    // b_wire[r][c] = B data entering PE at row r, col c
+    // ----------------------------------------------------------
+    wire signed [7:0] a_wire [0:3][0:4]; // extra col for rightmost output
+    wire signed [7:0] b_wire [0:4][0:3]; // extra row for bottommost output
+
+    // Left edge: connect row feeds
+    assign a_wire[0][0] = a0;
+    assign a_wire[1][0] = a1;
+    assign a_wire[2][0] = a2;
+    assign a_wire[3][0] = a3;
+
+    // Top edge: connect col feeds
+    assign b_wire[0][0] = b0;
+    assign b_wire[0][1] = b1;
+    assign b_wire[0][2] = b2;
+    assign b_wire[0][3] = b3;
+
+    // ----------------------------------------------------------
+    // 4x4 PE grid
+    // ----------------------------------------------------------
+    genvar r, c;
+    generate
+        for (r = 0; r < 4; r = r+1) begin : ROW
+            for (c = 0; c < 4; c = c+1) begin : COL
+                pe u_pe (
+                    .clk    (clk),
+                    .rst_n  (rst_n),
+                    .enable (active),
+                    .a_in   (a_wire[r][c]),
+                    .b_in   (b_wire[r][c]),
+                    .a_out  (a_wire[r][c+1]),
+                    .b_out  (b_wire[r+1][c]),
+                    .acc    ()
+                );
+            end
+        end
+    endgenerate
+
+    // ----------------------------------------------------------
+    // Read results from each PE's accumulator
+    // ----------------------------------------------------------
+    assign c00=ROW[0].COL[0].u_pe.acc; assign c01=ROW[0].COL[1].u_pe.acc;
+    assign c02=ROW[0].COL[2].u_pe.acc; assign c03=ROW[0].COL[3].u_pe.acc;
+
+    assign c10=ROW[1].COL[0].u_pe.acc; assign c11=ROW[1].COL[1].u_pe.acc;
+    assign c12=ROW[1].COL[2].u_pe.acc; assign c13=ROW[1].COL[3].u_pe.acc;
+
+    assign c20=ROW[2].COL[0].u_pe.acc; assign c21=ROW[2].COL[1].u_pe.acc;
+    assign c22=ROW[2].COL[2].u_pe.acc; assign c23=ROW[2].COL[3].u_pe.acc;
+
+    assign c30=ROW[3].COL[0].u_pe.acc; assign c31=ROW[3].COL[1].u_pe.acc;
+    assign c32=ROW[3].COL[2].u_pe.acc; assign c33=ROW[3].COL[3].u_pe.acc;
+
+endmodule
